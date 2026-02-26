@@ -46,6 +46,7 @@ struct Record: AsyncParsableCommand {
         do {
             config = try LivekeetConfig.load()
         } catch {
+            Log.warning("Could not load config: \(error.localizedDescription). Using defaults.")
             config = LivekeetConfig()
         }
 

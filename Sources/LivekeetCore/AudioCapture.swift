@@ -152,7 +152,7 @@ public final class AudioCapture: @unchecked Sendable {
     private var stream: SCStream?
     private var micEngine: AVAudioEngine?
     private var outputHandler: StreamOutputHandler?
-    private var isRunning = false
+    private let isRunning = OSAllocatedUnfairLock(initialState: false)
     private var outputTimer: DispatchSourceTimer?
 
     let systemBuffer = RingBuffer(capacity: ringBufferCapacity)
@@ -165,7 +165,7 @@ public final class AudioCapture: @unchecked Sendable {
     private let outputFormat: AVAudioFormat
     private var converterLock = os_unfair_lock()
 
-    private var systemAudioFrameCount: UInt64 = 0
+    private let systemAudioFrameCount = OSAllocatedUnfairLock(initialState: UInt64(0))
     private var lastSystemPTS: CMTime = .invalid
     private var lastSystemDuration: CMTime = .invalid
 
@@ -181,10 +181,13 @@ public final class AudioCapture: @unchecked Sendable {
     private let restartState = OSAllocatedUnfairLock(initialState: RestartState())
 
     public let micOnly: Bool
+    public let systemOnly: Bool
     public var micGain: Float = 1.0
+    public private(set) var micPermissionDenied = false
 
-    public init(micOnly: Bool = false) {
+    public init(micOnly: Bool = false, systemOnly: Bool = false) {
         self.micOnly = micOnly
+        self.systemOnly = systemOnly
         self.outputFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: targetSampleRate,
@@ -245,9 +248,12 @@ public final class AudioCapture: @unchecked Sendable {
     // MARK: - Start/Stop
 
     public func start() async throws -> AsyncStream<AudioChunk> {
-        let hasPermission = await requestMicrophonePermission()
-        if !hasPermission {
-            Log.warning("Microphone permission not granted")
+        if !systemOnly {
+            let hasPermission = await requestMicrophonePermission()
+            if !hasPermission {
+                micPermissionDenied = true
+                Log.warning("Microphone permission not granted")
+            }
         }
 
         if !micOnly {
@@ -266,18 +272,22 @@ public final class AudioCapture: @unchecked Sendable {
             try await stream?.startCapture()
         }
 
-        try startMicrophoneCapture()
-        isRunning = true
+        if !systemOnly {
+            try startMicrophoneCapture()
+        }
+        isRunning.withLock { $0 = true }
 
         return startOutputLoop()
     }
 
     public func stop() async {
-        isRunning = false
+        isRunning.withLock { $0 = false }
         outputTimer?.cancel()
         outputTimer = nil
-        micEngine?.inputNode.removeTap(onBus: 0)
-        micEngine?.stop()
+        if !systemOnly {
+            micEngine?.inputNode.removeTap(onBus: 0)
+            micEngine?.stop()
+        }
         if !micOnly {
             try? await stream?.stopCapture()
             stream = nil
@@ -335,6 +345,9 @@ public final class AudioCapture: @unchecked Sendable {
 
         let currentPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let currentDuration = CMSampleBufferGetDuration(sampleBuffer)
+
+        os_unfair_lock_lock(&converterLock)
+
         if lastSystemPTS.isValid && currentPTS.isValid {
             let expectedPTS = CMTimeAdd(lastSystemPTS, lastSystemDuration)
             let gap = CMTimeSubtract(currentPTS, expectedPTS)
@@ -345,8 +358,6 @@ public final class AudioCapture: @unchecked Sendable {
         }
         lastSystemPTS = currentPTS
         lastSystemDuration = currentDuration
-
-        os_unfair_lock_lock(&converterLock)
 
         if let existing = systemAudioConverter, existing.inputFormat != pcmBuffer.format {
             Log.info("System audio format changed, recreating converter")
@@ -370,7 +381,7 @@ public final class AudioCapture: @unchecked Sendable {
             return
         }
         systemBuffer.write(samples)
-        systemAudioFrameCount += 1
+        systemAudioFrameCount.withLock { $0 += 1 }
 
         restartState.withLock { state in
             if let lastRestart = state.lastTime,
@@ -384,9 +395,9 @@ public final class AudioCapture: @unchecked Sendable {
     private func clearSystemAudioConverter() {
         os_unfair_lock_lock(&converterLock)
         systemAudioConverter = nil
-        os_unfair_lock_unlock(&converterLock)
         lastSystemPTS = .invalid
         lastSystemDuration = .invalid
+        os_unfair_lock_unlock(&converterLock)
     }
 
     // MARK: - Microphone Capture
@@ -424,7 +435,7 @@ public final class AudioCapture: @unchecked Sendable {
     private func startOutputLoop() -> AsyncStream<AudioChunk> {
         let systemBuffer = self.systemBuffer
         let micBuffer = self.micBuffer
-        let includeMic = true
+        let includeMic = !self.systemOnly
         let isMicOnly = self.micOnly
 
         let systemFloats = UnsafeMutablePointer<Float>.allocate(capacity: outputFrameSize)
@@ -446,10 +457,10 @@ public final class AudioCapture: @unchecked Sendable {
             var lastWatchdogFrameCount: UInt64 = 0
             var watchdogStaleTicks = 0
             let watchdogThresholdTicks = 31
-            weak let weakSelf = self
+            weak var weakSelf = self
 
             timer.setEventHandler { [systemBuffer, micBuffer, systemFloats, micFloats] in
-                guard let strongSelf = weakSelf, strongSelf.isRunning else { return }
+                guard let strongSelf = weakSelf, strongSelf.isRunning.withLock({ $0 }) else { return }
 
                 // For mic-only mode, wait for mic data; otherwise wait for system data
                 if !isMicOnly {
@@ -461,7 +472,7 @@ public final class AudioCapture: @unchecked Sendable {
                     }
 
                     // System audio watchdog
-                    let currentFrameCount = strongSelf.systemAudioFrameCount
+                    let currentFrameCount = strongSelf.systemAudioFrameCount.withLock { $0 }
                     if currentFrameCount == lastWatchdogFrameCount {
                         watchdogStaleTicks += 1
                         if watchdogStaleTicks == watchdogThresholdTicks {
@@ -539,6 +550,8 @@ public final class AudioCapture: @unchecked Sendable {
         let backoff = min(pow(2.0, Double(attempt.num - 1)), 30.0)
         Log.info("Stream restart: attempt \(attempt.num)/\(attempt.max) (backoff \(Int(backoff))s)")
         try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+
+        guard isRunning.withLock({ $0 }) else { return }
 
         try? await stream?.stopCapture()
         stream = nil

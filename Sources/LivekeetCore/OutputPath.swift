@@ -87,7 +87,7 @@ private let dateOnlyFormatter: DateFormatter = {
 
 private let timeOnlyFormatter: DateFormatter = {
     let f = DateFormatter()
-    f.dateFormat = "HH-MM-SS"
+    f.dateFormat = "HH-mm-ss"
     return f
 }()
 

@@ -10,6 +10,7 @@ public struct LivekeetConfig: Sendable {
     public var defaultModel: String
     public var otherNames: [String]
     public var micOnly: Bool
+    public var systemOnly: Bool
     public var multilingual: Bool
     public var showStatus: Bool
     public var dumpAudio: Bool
@@ -21,6 +22,7 @@ public struct LivekeetConfig: Sendable {
         defaultModel: String = "mlx-community/parakeet-tdt-0.6b-v2",
         otherNames: [String] = [],
         micOnly: Bool = false,
+        systemOnly: Bool = false,
         multilingual: Bool = false,
         showStatus: Bool = false,
         dumpAudio: Bool = false
@@ -31,6 +33,7 @@ public struct LivekeetConfig: Sendable {
         self.defaultModel = defaultModel
         self.otherNames = otherNames
         self.micOnly = micOnly
+        self.systemOnly = systemOnly
         self.multilingual = multilingual
         self.showStatus = showStatus
         self.dumpAudio = dumpAudio

@@ -35,11 +35,13 @@ public actor SpeechDetector {
     // Sortformer streaming state
     private var streamingState: StreamingState?
     private let sampleRate: Int = 16000
-    private let chunkSeconds: Float = 5.0  // Feed chunks of this size to Sortformer
+    private let chunkSeconds: Float = 2.0  // Feed chunks of this size to Sortformer
 
     // Track last active segment for detecting silence gaps
     private var lastActiveEndTime: Float = 0
-    private var silenceGapThreshold: Float = 1.5  // seconds
+    private var lastActiveSpeaker: Int = 0
+    private var silenceGapThreshold: Float = 0.8  // seconds
+    private let maxSegmentDuration: TimeInterval = 10.0  // force emit during continuous speech
 
     public init(
         model: SortformerModel,
@@ -128,15 +130,26 @@ public actor SpeechDetector {
             let gapFromLast = diarSegment.start - lastActiveEndTime
 
             if gapFromLast > silenceGapThreshold && !segmentAudio.isEmpty {
-                // Silence gap detected — emit the accumulated segment
-                if let segment = emitCurrentSegment(speakerIndex: diarSegment.speaker) {
+                // Silence gap detected — emit the accumulated segment with the previous speaker's label
+                if let segment = emitCurrentSegment(speakerIndex: lastActiveSpeaker) {
                     completedSegments.append(segment)
                 }
                 // Start new segment
                 segmentStartTime = referenceTime
             }
 
+            lastActiveSpeaker = diarSegment.speaker
             lastActiveEndTime = diarSegment.end
+        }
+
+        // Force emit if segment exceeds max duration (continuous speech with no pauses)
+        let currentDuration = Double(segmentAudio.count) / Double(sampleRate)
+        if currentDuration >= maxSegmentDuration {
+            let speaker = output.segments.last?.speaker ?? 0
+            if let segment = emitCurrentSegment(speakerIndex: speaker) {
+                completedSegments.append(segment)
+            }
+            segmentStartTime = referenceTime
         }
 
         totalSamplesProcessed += chunk.count

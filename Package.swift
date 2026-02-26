@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "LivekeetCore", targets: ["LivekeetCore"]),
         .executable(name: "livekeet", targets: ["livekeet"]),
+        .executable(name: "LivekeetApp", targets: ["LivekeetApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/Blaizzy/mlx-audio-swift.git", branch: "main"),
@@ -29,6 +30,10 @@ let package = Package(
                 "LivekeetCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
+        ),
+        .executableTarget(
+            name: "LivekeetApp",
+            dependencies: ["LivekeetCore"]
         ),
     ]
 )
