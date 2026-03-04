@@ -176,8 +176,8 @@ public final class AudioCapture: @unchecked Sendable {
         var lastTime: Date?
         var lastAttemptTime: Date?
     }
-    private let maxRestarts = 10
-    private let minRestartInterval: TimeInterval = 10
+    private let maxRestarts = 20
+    private let minRestartInterval: TimeInterval = 3
     private let restartState = OSAllocatedUnfairLock(initialState: RestartState())
 
     public let micOnly: Bool
@@ -352,8 +352,13 @@ public final class AudioCapture: @unchecked Sendable {
             let expectedPTS = CMTimeAdd(lastSystemPTS, lastSystemDuration)
             let gap = CMTimeSubtract(currentPTS, expectedPTS)
             let gapSeconds = CMTimeGetSeconds(gap)
-            if gapSeconds > 0.2 {
-                Log.warning("System audio gap detected (\(String(format: "%.0f", gapSeconds * 1000))ms)")
+            if gapSeconds > 1.0 {
+                Log.warning("System audio gap (\(String(format: "%.0f", gapSeconds * 1000))ms), restarting stream")
+                os_unfair_lock_unlock(&converterLock)
+                restartCapture()
+                return
+            } else if gapSeconds > 0.2 {
+                Log.warning("System audio gap (\(String(format: "%.0f", gapSeconds * 1000))ms)")
             }
         }
         lastSystemPTS = currentPTS
@@ -385,7 +390,7 @@ public final class AudioCapture: @unchecked Sendable {
 
         restartState.withLock { state in
             if let lastRestart = state.lastTime,
-               Date().timeIntervalSince(lastRestart) > 60 {
+               Date().timeIntervalSince(lastRestart) > 30 {
                 state.count = 0
                 state.lastTime = nil
             }
@@ -456,7 +461,7 @@ public final class AudioCapture: @unchecked Sendable {
             var outputStarted = false
             var lastWatchdogFrameCount: UInt64 = 0
             var watchdogStaleTicks = 0
-            let watchdogThresholdTicks = 31
+            let watchdogThresholdTicks = 16  // ~1s at 64ms intervals
             weak var weakSelf = self
 
             timer.setEventHandler { [systemBuffer, micBuffer, systemFloats, micFloats] in
@@ -547,7 +552,7 @@ public final class AudioCapture: @unchecked Sendable {
         }
         defer { restartState.withLock { $0.isRestarting = false } }
 
-        let backoff = min(pow(2.0, Double(attempt.num - 1)), 30.0)
+        let backoff = min(0.25 * pow(2.0, Double(attempt.num - 1)), 10.0)
         Log.info("Stream restart: attempt \(attempt.num)/\(attempt.max) (backoff \(Int(backoff))s)")
         try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
 
