@@ -77,6 +77,14 @@ final class AppendablePCM {
     }
 }
 
+// MARK: - Transcription Work Item
+
+private struct TranscriptionWorkItem: Sendable {
+    let segment: DetectedSegment
+    let channel: String
+    let segmentNumber: Int
+}
+
 // MARK: - Transcriber
 
 /// Main pipeline orchestrator: AudioCapture → SpeechDetector (Sortformer) → Parakeet → MarkdownWriter.
@@ -84,12 +92,17 @@ public actor Transcriber {
     private let capture: AudioCapture
     private let micDetector: SpeechDetector?
     private let sysDetector: SpeechDetector?
-    private let sttModel: any STTGenerationModel
+    private nonisolated(unsafe) let sttModel: any STTGenerationModel
     private let writer: MarkdownWriter
     private let config: LivekeetConfig
     private var isStopped = false
     private var segmentCounter = 0
     private let audioDumpDir: URL?
+
+    // Transcription work queue — decouples STT inference from audio loop
+    private let transcriptionStream: AsyncStream<TranscriptionWorkItem>
+    private let transcriptionContinuation: AsyncStream<TranscriptionWorkItem>.Continuation
+    private var pendingTranscriptionCount = 0
 
     // Batch diarization — audio stored on disk to avoid unbounded memory growth
     private let micPCM: AppendablePCM
@@ -178,6 +191,13 @@ public actor Transcriber {
         self.micPCM = try AppendablePCM(url: pcmDir.appendingPathComponent("mic.pcm"))
         self.sysPCM = try AppendablePCM(url: pcmDir.appendingPathComponent("sys.pcm"))
 
+        // Transcription work queue
+        let (tStream, tContinuation) = AsyncStream<TranscriptionWorkItem>.makeStream(
+            bufferingPolicy: .bufferingNewest(10)
+        )
+        self.transcriptionStream = tStream
+        self.transcriptionContinuation = tContinuation
+
         // Cap MLX buffer cache to prevent unbounded growth across inference calls.
         // Model weights are "active" memory, unaffected by cache limit.
         Memory.cacheLimit = 256 * 1024 * 1024  // 256 MB
@@ -204,10 +224,8 @@ public actor Transcriber {
 
         // Process audio chunks with concurrent status monitoring
         await withTaskGroup(of: Void.self) { group in
-            if config.showStatus {
-                group.addTask {
-                    await self.statusWorker()
-                }
+            group.addTask {
+                await self.statusWorker()
             }
 
             group.addTask {
@@ -219,28 +237,18 @@ public actor Transcriber {
             }
 
             group.addTask {
+                await self.transcriptionWorker()
+            }
+
+            group.addTask {
                 for await chunk in audioStream {
                     let stopped = await self.isStopped
                     if stopped { break }
                     await self.processChunk(chunk)
                 }
+                // Audio loop done — flush detectors and drain transcription queue
+                await self.flushAndFinishTranscriptions()
             }
-        }
-
-        // Flush remaining segments
-        do {
-            if let micDetector = micDetector {
-                for segment in try await micDetector.flush() {
-                    await transcribeAndWrite(segment: segment, channel: "mic")
-                }
-            }
-            if let sysDetector = sysDetector {
-                for segment in try await sysDetector.flush() {
-                    await transcribeAndWrite(segment: segment, channel: "system")
-                }
-            }
-        } catch {
-            Log.error("Flush error: \(error)")
         }
 
         // Final batch diarization pass
@@ -285,7 +293,7 @@ public actor Transcriber {
             do {
                 let micSegments = try await micDetector.feed(chunk.mic, at: chunk.timestamp)
                 for segment in micSegments {
-                    await transcribeAndWrite(segment: segment, channel: "mic")
+                    enqueueTranscription(segment: segment, channel: "mic")
                 }
             } catch {
                 Log.error("Mic detection error: \(error)")
@@ -297,7 +305,7 @@ public actor Transcriber {
             do {
                 let sysSegments = try await sysDetector.feed(chunk.system, at: chunk.timestamp)
                 for segment in sysSegments {
-                    await transcribeAndWrite(segment: segment, channel: "system")
+                    enqueueTranscription(segment: segment, channel: "system")
                 }
             } catch {
                 Log.error("System detection error: \(error)")
@@ -305,38 +313,88 @@ public actor Transcriber {
         }
     }
 
-    private func transcribeAndWrite(segment: DetectedSegment, channel: String) async {
+    private func enqueueTranscription(segment: DetectedSegment, channel: String) {
         segmentCounter += 1
-        let segNum = segmentCounter
-
-        // Dump audio segment as WAV for debugging
-        if let dumpDir = audioDumpDir {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HHmmss"
-            let timeStr = formatter.string(from: segment.startTime)
-            let duration = String(format: "%.1fs", segment.duration)
-            let filename = "\(String(format: "%03d", segNum))_\(channel)_\(timeStr)_\(duration).wav"
-            let wavURL = dumpDir.appendingPathComponent(filename)
-            do {
-                try WAVWriter.write(samples: segment.audio, to: wavURL)
-            } catch {
-                Log.error("Failed to dump audio: \(error)")
-            }
+        let item = TranscriptionWorkItem(
+            segment: segment, channel: channel, segmentNumber: segmentCounter
+        )
+        let result = transcriptionContinuation.yield(item)
+        pendingTranscriptionCount += 1
+        if case .dropped = result {
+            pendingTranscriptionCount -= 1
+            Log.warning("Transcription queue full, dropped oldest segment")
         }
+    }
 
-        // Skip very short segments that can cause model errors (especially Qwen3-ASR)
-        guard segment.audio.count >= 24000 else { return }  // minimum 1.5 seconds at 16kHz
+    private func flushAndFinishTranscriptions() async {
+        do {
+            if let micDetector = micDetector {
+                for segment in try await micDetector.flush() {
+                    enqueueTranscription(segment: segment, channel: "mic")
+                }
+            }
+            if let sysDetector = sysDetector {
+                for segment in try await sysDetector.flush() {
+                    enqueueTranscription(segment: segment, channel: "system")
+                }
+            }
+        } catch {
+            Log.error("Flush error: \(error)")
+        }
+        transcriptionContinuation.finish()
+    }
 
-        let audioArray = MLXArray(segment.audio)
-        let result = sttModel.generate(audio: audioArray)
-        Memory.clearCache()
+    private func transcriptionWorker() async {
+        for await item in transcriptionStream {
+            pendingTranscriptionCount -= 1
 
+            // Dump audio segment as WAV for debugging
+            if let dumpDir = audioDumpDir {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "HHmmss"
+                let timeStr = formatter.string(from: item.segment.startTime)
+                let duration = String(format: "%.1fs", item.segment.duration)
+                let filename = "\(String(format: "%03d", item.segmentNumber))_\(item.channel)_\(timeStr)_\(duration).wav"
+                let wavURL = dumpDir.appendingPathComponent(filename)
+                do {
+                    try WAVWriter.write(samples: item.segment.audio, to: wavURL)
+                } catch {
+                    Log.error("Failed to dump audio: \(error)")
+                }
+            }
+
+            // Skip very short segments that can cause model errors
+            guard item.segment.audio.count >= 24000 else { continue }
+
+            // Run STT inference off-actor to unblock audio processing
+            let audio = item.segment.audio
+            let audioDuration = item.segment.duration
+            nonisolated(unsafe) let model = sttModel
+            let inferenceStart = Date()
+
+            let result = await Task.detached {
+                let audioArray = MLXArray(audio)
+                let output = model.generate(audio: audioArray)
+                Memory.clearCache()
+                return output
+            }.value
+
+            let inferenceTime = Date().timeIntervalSince(inferenceStart)
+            let ratio = audioDuration / inferenceTime
+            Log.info("STT inference: \(String(format: "%.1f", audioDuration))s audio in \(String(format: "%.1f", inferenceTime))s (\(String(format: "%.1f", ratio))x realtime)")
+
+            await writeTranscriptionResult(result, segment: item.segment, channel: item.channel)
+        }
+    }
+
+    private func writeTranscriptionResult(
+        _ result: STTOutput, segment: DetectedSegment, channel: String
+    ) async {
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
         let speaker = resolveSpeaker(channel: channel, speakerIndex: segment.speakerIndex)
 
-        // Compute base offset from recording start
         let baseOffset: Float
         if let start = recordingStartTime {
             baseOffset = Float(segment.startTime.timeIntervalSince(start))
@@ -344,7 +402,6 @@ public actor Transcriber {
             baseOffset = 0
         }
 
-        // Write and store per-sentence for precise batch speaker matching
         if let sentences = result.segments, !sentences.isEmpty {
             for sentence in sentences {
                 guard let sentenceText = sentence["text"] as? String,
@@ -366,7 +423,6 @@ public actor Transcriber {
                 await writer.writeSegment(time: sentenceTime, speaker: speaker, text: trimmed)
             }
         } else {
-            // Fallback: write whole segment as one entry
             let seg = TranscriptSegment(
                 offsetSeconds: baseOffset,
                 text: text,
@@ -573,7 +629,9 @@ public actor Transcriber {
                 let snap = Memory.snapshot()
                 let activeMB = snap.activeMemory / (1024 * 1024)
                 let cacheMB = snap.cacheMemory / (1024 * 1024)
-                Log.info("Status: active=\(activeMB)MB cache=\(cacheMB)MB")
+                let micOvf = capture.micBuffer.overflows
+                let sysOvf = capture.systemBuffer.overflows
+                Log.info("Status: active=\(activeMB)MB cache=\(cacheMB)MB segments=\(transcriptSegments.count) pending=\(pendingTranscriptionCount) micOvf=\(micOvf.count)/\(micOvf.samples)smp sysOvf=\(sysOvf.count)/\(sysOvf.samples)smp")
                 nextStatus = Date().addingTimeInterval(statusInterval)
             }
         }

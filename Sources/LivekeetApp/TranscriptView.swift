@@ -83,30 +83,34 @@ struct SpeakerGroupView: View {
             if !isMic { Spacer(minLength: 60) }
 
             VStack(alignment: isMic ? .leading : .trailing, spacing: 2) {
-                // Speaker name + timestamp
-                HStack(spacing: 5) {
-                    Text(group.speaker)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(speakerColor)
-                        .onTapGesture {
-                            onRenameSpeaker(group.channel, group.speakerIndex, group.speaker)
-                        }
-                        .onHover { hovering in
-                            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                        }
-                    Text(group.lines.first?.timestamp ?? "")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 4)
+                // Speaker name
+                Text(group.speaker)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(speakerColor)
+                    .padding(.horizontal, 4)
+                    .onTapGesture {
+                        onRenameSpeaker(group.channel, group.speakerIndex, group.speaker)
+                    }
+                    .onHover { hovering in
+                        if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                    }
 
-                // Bubble
-                Text(group.lines.map(\.text).joined(separator: "\n"))
-                    .font(.system(size: 13))
-                    .textSelection(.enabled)
-                    .padding(.vertical, 6)
-                    .padding(.horizontal, 10)
-                    .id(group.lines.last?.id ?? group.id)
+                // Bubble with per-line timestamps
+                VStack(alignment: isMic ? .leading : .trailing, spacing: 3) {
+                    ForEach(group.lines, id: \.id) { line in
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            Text(line.timestamp)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            Text(line.text)
+                                .font(.system(size: 13))
+                        }
+                        .textSelection(.enabled)
+                    }
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 10)
+                .id(group.lines.last?.id ?? group.id)
                 .background(
                     speakerColor.opacity(0.08),
                     in: RoundedRectangle(cornerRadius: 12)

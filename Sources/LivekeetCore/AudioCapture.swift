@@ -52,6 +52,8 @@ final class RingBuffer: @unchecked Sendable {
     private var availableCount: Int = 0
     private var lock = os_unfair_lock()
     private var underrunCount: Int = 0
+    private var overflowCount: Int = 0
+    private var overflowSamples: Int = 0
 
     init(capacity: Int) {
         precondition(capacity & (capacity - 1) == 0, "Ring buffer capacity must be a power of 2")
@@ -72,6 +74,8 @@ final class RingBuffer: @unchecked Sendable {
         let toWrite = min(count, capacity)
         let overflow = (availableCount + toWrite) - capacity
         if overflow > 0 {
+            overflowCount += 1
+            overflowSamples += overflow
             readIndex = (readIndex + overflow) & mask
             availableCount -= overflow
         }
@@ -127,6 +131,12 @@ final class RingBuffer: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         return underrunCount
+    }
+
+    var overflows: (count: Int, samples: Int) {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        return (count: overflowCount, samples: overflowSamples)
     }
 }
 
@@ -461,6 +471,8 @@ public final class AudioCapture: @unchecked Sendable {
             var outputStarted = false
             var lastWatchdogFrameCount: UInt64 = 0
             var watchdogStaleTicks = 0
+            var lastMicOverflows = 0
+            var lastSysOverflows = 0
             let watchdogThresholdTicks = 16  // ~1s at 64ms intervals
             weak var weakSelf = self
 
@@ -499,6 +511,18 @@ public final class AudioCapture: @unchecked Sendable {
                         Log.info("Output started (mic-only)")
                     }
                     _ = micBuffer.readFloat(into: micFloats, count: outputFrameSize)
+                }
+
+                // Check for ring buffer overflows
+                let currentMicOvf = micBuffer.overflows.count
+                let currentSysOvf = systemBuffer.overflows.count
+                if currentMicOvf > lastMicOverflows {
+                    Log.warning("Mic buffer overflow: \(currentMicOvf - lastMicOverflows) events since last check")
+                    lastMicOverflows = currentMicOvf
+                }
+                if currentSysOvf > lastSysOverflows {
+                    Log.warning("System buffer overflow: \(currentSysOvf - lastSysOverflows) events since last check")
+                    lastSysOverflows = currentSysOvf
                 }
 
                 let micArray = Array(UnsafeBufferPointer(start: micFloats, count: outputFrameSize))

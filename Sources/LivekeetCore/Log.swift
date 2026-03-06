@@ -1,16 +1,23 @@
 import Foundation
+import os
 
-/// Simple stderr logger used throughout LivekeetCore.
+/// Unified logger using os.Logger — visible in Console.app under com.livekeet.core.
 public enum Log {
+    private static let logger = Logger(subsystem: "com.livekeet.core", category: "pipeline")
+
+    public static func debug(_ message: String) {
+        logger.debug("\(message, privacy: .public)")
+    }
+
     public static func info(_ message: String) {
-        fputs("\(message)\n", stderr)
+        logger.info("\(message, privacy: .public)")
     }
 
     public static func warning(_ message: String) {
-        fputs("Warning: \(message)\n", stderr)
+        logger.warning("\(message, privacy: .public)")
     }
 
     public static func error(_ message: String) {
-        fputs("Error: \(message)\n", stderr)
+        logger.error("\(message, privacy: .public)")
     }
 }

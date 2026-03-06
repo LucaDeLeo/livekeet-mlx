@@ -111,6 +111,7 @@ public actor SpeechDetector {
         guard let state = streamingState else { return [] }
 
         let chunkArray = MLXArray(chunk)
+        let feedStart = Date()
         let (output, newState) = try await model.feed(
             chunk: chunkArray,
             state: state,
@@ -120,12 +121,20 @@ public actor SpeechDetector {
             mergeGap: 0.0
         )
         streamingState = newState
+        let feedTime = Date().timeIntervalSince(feedStart)
+        if feedTime > 0.5 {
+            Log.warning("Sortformer feed took \(String(format: "%.1f", feedTime))s (chunk: \(String(format: "%.1f", Float(chunk.count) / Float(sampleRate)))s audio)")
+        }
 
         var completedSegments: [DetectedSegment] = []
 
         // Sortformer returns segments with timestamps relative to the stream start.
         // When there's a gap between segments > silenceGapThreshold, we treat that
         // as a speech boundary and emit the accumulated audio as a segment.
+        if !output.segments.isEmpty {
+            Log.debug("Diarization: \(output.segments.count) segments in chunk")
+        }
+
         for diarSegment in output.segments {
             let gapFromLast = diarSegment.start - lastActiveEndTime
 
@@ -178,6 +187,8 @@ public actor SpeechDetector {
             segmentStartTime = nil
             return nil
         }
+
+        Log.debug("Segment emitted: \(String(format: "%.1f", duration))s speaker=\(speakerIndex) rms=\(String(format: "%.4f", rms))")
 
         let segment = DetectedSegment(
             audio: segmentAudio,

@@ -49,7 +49,7 @@ for metal_file in ${METAL_FILES}; do
         -I "${METAL_SRC_DIR}" \
         -I "${KERNELS_DIR}" \
         -I "${INCLUDE_DIR}" \
-        -std=metal3.0 \
+        -std=metal3.2 \
         -o "${air_file}" \
         "${metal_file}"
     AIR_FILES="${AIR_FILES} ${air_file}"
