@@ -18,6 +18,7 @@ final class TranscriptViewModel {
     var isRecording = false
     var isLoading = false
     var errorMessage: String?
+    var savedFilePath: String?
 
     // Rename state
     var renamingChannel: String?
@@ -34,6 +35,7 @@ final class TranscriptViewModel {
         isRecording = true
         isLoading = true
         errorMessage = nil
+        savedFilePath = nil
         segments = []
 
         // Cancel any lingering tasks from a previous session
@@ -113,6 +115,8 @@ final class TranscriptViewModel {
                     speakerIndex: seg.speakerIndex
                 )
             }
+        case .completed(let path):
+            savedFilePath = path
         }
     }
 

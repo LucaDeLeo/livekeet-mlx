@@ -25,6 +25,7 @@ struct SpeakerKey: Hashable {
 public enum TranscriptEvent: Sendable {
     case segment(TranscriptSegment)
     case rewrite([TranscriptSegment])
+    case completed(outputPath: String)
 }
 
 // MARK: - Disk-Backed PCM Storage
@@ -94,6 +95,7 @@ public actor Transcriber {
     private let sysDetector: SpeechDetector?
     private nonisolated(unsafe) let sttModel: any STTGenerationModel
     private let writer: MarkdownWriter
+    private let outputPath: URL
     private let config: LivekeetConfig
     private var isStopped = false
     private var segmentCounter = 0
@@ -110,9 +112,25 @@ public actor Transcriber {
     private let pcmTempDir: URL
     private var transcriptSegments: [TranscriptSegment] = []
     private var recordingStartTime: Date?
-    private let sortformerModel: SortformerModel
+    private let sortformerModel: SortformerModel?
     private var batchPassCount = 0
     private var speakerRenames: [SpeakerKey: String] = [:]
+
+    // LLM transcript correction
+    private var corrector: TranscriptCorrector?
+    private var lastCorrectedCount = 0
+    private let correctionInterval: TimeInterval = 45
+    private let correctionContextSize = 10
+    private let correctionBatchSize = 20
+
+    // Simple energy-based segmentation (when diarization is disabled)
+    private var simpleSegMicAudio: [Float] = []
+    private var simpleSegMicStart: Date?
+    private var simpleSegSysAudio: [Float] = []
+    private var simpleSegSysStart: Date?
+    private let simpleSegMaxDuration: TimeInterval = 10.0
+    private let simpleSegMinDuration: TimeInterval = 1.5
+    private let simpleSegSilenceThreshold: Float = 0.005
 
     // Incremental batch diarization state
     private var batchMicState: StreamingState?
@@ -158,13 +176,20 @@ public actor Transcriber {
         }
         Log.info("STT model ready")
 
-        // Load Sortformer diarization model (single shared instance — stateless weights)
-        Log.info("Loading speaker diarization model...")
-        let sortformerModel = try await SortformerModel.fromPretrained("mlx-community/diar_sortformer_4spk-v1-fp32")
-        self.sortformerModel = sortformerModel
-        self.micDetector = config.systemOnly ? nil : SpeechDetector(model: sortformerModel)
-        self.sysDetector = config.micOnly ? nil : SpeechDetector(model: sortformerModel)
-        Log.info("Diarization model ready")
+        // Load Sortformer diarization model (unless disabled)
+        if !config.disableDiarization {
+            Log.info("Loading speaker diarization model...")
+            let sortformerModel = try await SortformerModel.fromPretrained("mlx-community/diar_sortformer_4spk-v1-fp32")
+            self.sortformerModel = sortformerModel
+            self.micDetector = config.systemOnly ? nil : SpeechDetector(model: sortformerModel)
+            self.sysDetector = config.micOnly ? nil : SpeechDetector(model: sortformerModel)
+            Log.info("Diarization model ready")
+        } else {
+            Log.info("Diarization disabled")
+            self.sortformerModel = nil
+            self.micDetector = nil
+            self.sysDetector = nil
+        }
 
         // Resolve output path
         let outputPath = resolveOutputPath(arg: outputArg, config: config)
@@ -172,6 +197,7 @@ public actor Transcriber {
         if wasSuffixed {
             Log.info("Output exists; saving to \(uniquePath.lastPathComponent)")
         }
+        self.outputPath = uniquePath
         self.writer = try MarkdownWriter(path: uniquePath)
 
         if config.dumpAudio {
@@ -232,12 +258,20 @@ public actor Transcriber {
                 await self.noAudioMonitor()
             }
 
-            group.addTask {
-                await self.batchDiarizationWorker()
+            if !config.disableDiarization {
+                group.addTask {
+                    await self.batchDiarizationWorker()
+                }
             }
 
             group.addTask {
                 await self.transcriptionWorker()
+            }
+
+            if config.enableCorrection {
+                group.addTask {
+                    await self.correctionWorker()
+                }
             }
 
             group.addTask {
@@ -252,8 +286,10 @@ public actor Transcriber {
         }
 
         // Final batch diarization pass
-        Log.info("Running final speaker analysis...")
-        await runBatchDiarization(final: true)
+        if !config.disableDiarization {
+            Log.info("Running final speaker analysis...")
+            await runBatchDiarization(final: true)
+        }
 
         await writer.writeFooter()
         await capture.stop()
@@ -263,6 +299,7 @@ public actor Transcriber {
         sysPCM.cleanup()
         try? FileManager.default.removeItem(at: pcmTempDir)
 
+        eventContinuation.yield(.completed(outputPath: outputPath.path))
         eventContinuation.finish()
         print("\nSaved transcript")
     }
@@ -289,26 +326,34 @@ public actor Transcriber {
         }
 
         // Process mic channel
-        if let micDetector = micDetector {
-            do {
-                let micSegments = try await micDetector.feed(chunk.mic, at: chunk.timestamp)
-                for segment in micSegments {
-                    enqueueTranscription(segment: segment, channel: "mic")
+        if !config.systemOnly {
+            if let micDetector = micDetector {
+                do {
+                    let micSegments = try await micDetector.feed(chunk.mic, at: chunk.timestamp)
+                    for segment in micSegments {
+                        enqueueTranscription(segment: segment, channel: "mic")
+                    }
+                } catch {
+                    Log.error("Mic detection error: \(error)")
                 }
-            } catch {
-                Log.error("Mic detection error: \(error)")
+            } else if config.disableDiarization {
+                processSimpleSegmentation(chunk.mic, channel: "mic", at: chunk.timestamp)
             }
         }
 
         // Process system channel
-        if let sysDetector = sysDetector, !chunk.system.isEmpty {
-            do {
-                let sysSegments = try await sysDetector.feed(chunk.system, at: chunk.timestamp)
-                for segment in sysSegments {
-                    enqueueTranscription(segment: segment, channel: "system")
+        if !config.micOnly && !chunk.system.isEmpty {
+            if let sysDetector = sysDetector {
+                do {
+                    let sysSegments = try await sysDetector.feed(chunk.system, at: chunk.timestamp)
+                    for segment in sysSegments {
+                        enqueueTranscription(segment: segment, channel: "system")
+                    }
+                } catch {
+                    Log.error("System detection error: \(error)")
                 }
-            } catch {
-                Log.error("System detection error: \(error)")
+            } else if config.disableDiarization {
+                processSimpleSegmentation(chunk.system, channel: "system", at: chunk.timestamp)
             }
         }
     }
@@ -323,6 +368,67 @@ public actor Transcriber {
         if case .dropped = result {
             pendingTranscriptionCount -= 1
             Log.warning("Transcription queue full, dropped oldest segment")
+        }
+    }
+
+    private func processSimpleSegmentation(_ audio: [Float], channel: String, at time: Date) {
+        let isSystem = channel == "system"
+        if isSystem {
+            simpleSegSysAudio.append(contentsOf: audio)
+            if simpleSegSysStart == nil { simpleSegSysStart = time }
+        } else {
+            simpleSegMicAudio.append(contentsOf: audio)
+            if simpleSegMicStart == nil { simpleSegMicStart = time }
+        }
+
+        let segAudio = isSystem ? simpleSegSysAudio : simpleSegMicAudio
+        let segStart = isSystem ? simpleSegSysStart : simpleSegMicStart
+        let duration = Double(segAudio.count) / 16000.0
+
+        var shouldEmit = false
+        if duration >= simpleSegMaxDuration {
+            shouldEmit = true
+        } else if duration >= simpleSegMinDuration {
+            // Check if the last 0.5s is silence
+            let tailCount = min(Int(16000 * 0.5), segAudio.count)
+            let tail = segAudio.suffix(tailCount)
+            let rms = sqrt(tail.reduce(Float(0)) { $0 + $1 * $1 } / Float(tail.count))
+            shouldEmit = rms < simpleSegSilenceThreshold
+        }
+
+        if shouldEmit, let start = segStart {
+            let segment = DetectedSegment(
+                audio: segAudio, startTime: start, duration: duration, speakerIndex: 0
+            )
+            enqueueTranscription(segment: segment, channel: channel)
+            if isSystem {
+                simpleSegSysAudio = []
+                simpleSegSysStart = nil
+            } else {
+                simpleSegMicAudio = []
+                simpleSegMicStart = nil
+            }
+        }
+    }
+
+    private func flushSimpleSegments() {
+        if !simpleSegMicAudio.isEmpty, let start = simpleSegMicStart {
+            let duration = Double(simpleSegMicAudio.count) / 16000.0
+            let segment = DetectedSegment(
+                audio: simpleSegMicAudio, startTime: start, duration: duration, speakerIndex: 0
+            )
+            enqueueTranscription(segment: segment, channel: "mic")
+            simpleSegMicAudio = []
+            simpleSegMicStart = nil
+        }
+        if !simpleSegSysAudio.isEmpty, let start = simpleSegSysStart {
+            let duration = Double(simpleSegSysAudio.count) / 16000.0
+            let segment = DetectedSegment(
+                audio: simpleSegSysAudio, startTime: start, duration: duration, speakerIndex: 0
+            )
+            enqueueTranscription(segment: segment, channel: "system")
+            simpleSegSysAudio = []
+            simpleSegSysStart = nil
         }
     }
 
@@ -341,6 +447,7 @@ public actor Transcriber {
         } catch {
             Log.error("Flush error: \(error)")
         }
+        flushSimpleSegments()
         transcriptionContinuation.finish()
     }
 
@@ -463,25 +570,13 @@ public actor Transcriber {
     // MARK: - Batch Diarization
 
     private func batchDiarizationWorker() async {
-        // Wait 30s before first batch (checking for stop every second)
-        for _ in 0..<30 {
-            if isStopped { return }
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-        }
-
-        while !isStopped {
-            await runBatchDiarization(final: false)
-
-            // Wait 30s between batches
-            for _ in 0..<30 {
-                if isStopped { return }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
+        await periodicWorker(initialDelay: 30, interval: 30) {
+            await self.runBatchDiarization(final: false)
         }
     }
 
     private func runBatchDiarization(final isFinal: Bool) async {
-        guard !transcriptSegments.isEmpty else { return }
+        guard let sortformerModel, !transcriptSegments.isEmpty else { return }
 
         batchPassCount += 1
 
@@ -559,9 +654,7 @@ public actor Transcriber {
         }
         // Update stored segments with resolved speakers
         transcriptSegments = resolved
-        let writerSegments = resolved.map { (timestamp: $0.timestamp, speaker: $0.speaker, text: $0.text) }
-        await writer.rewriteAll(segments: writerSegments)
-        eventContinuation.yield(.rewrite(resolved))
+        await rewriteAndNotify()
     }
 
     private func resolveBatchSpeakerIndex(
@@ -595,6 +688,92 @@ public actor Transcriber {
         return 0
     }
 
+    // MARK: - LLM Transcript Correction
+
+    private func correctionWorker() async {
+        do {
+            corrector = try TranscriptCorrector()
+        } catch {
+            Log.error("Failed to initialize transcript corrector: \(error)")
+            return
+        }
+
+        await periodicWorker(initialDelay: 60, interval: Int(correctionInterval)) {
+            await self.runCorrectionPass()
+        }
+
+        // Final pass on remaining segments
+        await runCorrectionPass()
+        await corrector?.cleanup()
+    }
+
+    private func periodicWorker(initialDelay: Int, interval: Int, work: () async -> Void) async {
+        for _ in 0..<initialDelay {
+            if isStopped { return }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        while !isStopped {
+            await work()
+            for _ in 0..<interval {
+                if isStopped { return }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func runCorrectionPass() async {
+        guard let corrector, !transcriptSegments.isEmpty else { return }
+
+        let total = transcriptSegments.count
+        guard total > lastCorrectedCount else { return }
+
+        // Context: recent already-corrected segments
+        let contextStart = max(0, lastCorrectedCount - correctionContextSize)
+        let contextSegments = (contextStart < lastCorrectedCount)
+            ? Array(transcriptSegments[contextStart..<lastCorrectedCount])
+            : []
+
+        // New segments to correct
+        let endIndex = min(total, lastCorrectedCount + correctionBatchSize)
+        let targetSegments = Array(transcriptSegments[lastCorrectedCount..<endIndex])
+
+        var speakers = Set<String>()
+        speakers.insert(config.speakerName)
+        for name in config.otherNames { speakers.insert(name) }
+
+        let corrections = await corrector.correct(
+            segments: targetSegments, context: contextSegments, speakers: Array(speakers)
+        )
+
+        if !corrections.isEmpty {
+            var correctedCount = 0
+            for correction in corrections {
+                let actualIndex = lastCorrectedCount + correction.index
+                guard actualIndex < transcriptSegments.count else { continue }
+                let seg = transcriptSegments[actualIndex]
+                guard correction.text != seg.text else { continue }
+
+                transcriptSegments[actualIndex] = TranscriptSegment(
+                    offsetSeconds: seg.offsetSeconds,
+                    text: correction.text,
+                    channel: seg.channel,
+                    timestamp: seg.timestamp,
+                    startTime: seg.startTime,
+                    speakerIndex: seg.speakerIndex,
+                    speaker: seg.speaker
+                )
+                correctedCount += 1
+            }
+
+            if correctedCount > 0 {
+                Log.info("AI corrected \(correctedCount) segment(s)")
+                await rewriteAndNotify()
+            }
+        }
+
+        lastCorrectedCount = endIndex
+    }
+
     // MARK: - Speaker Renaming
 
     public func renameSpeaker(channel: String, speakerIndex: Int, newName: String) async {
@@ -614,7 +793,13 @@ public actor Transcriber {
                 speaker: resolveSpeaker(channel: seg.channel, speakerIndex: seg.speakerIndex)
             )
         }
-        let writerSegments = transcriptSegments.map { (timestamp: $0.timestamp, speaker: $0.speaker, text: $0.text) }
+        await rewriteAndNotify()
+    }
+
+    private func rewriteAndNotify() async {
+        let writerSegments = transcriptSegments.map {
+            (timestamp: $0.timestamp, speaker: $0.speaker, text: $0.text)
+        }
         await writer.rewriteAll(segments: writerSegments)
         eventContinuation.yield(.rewrite(transcriptSegments))
     }

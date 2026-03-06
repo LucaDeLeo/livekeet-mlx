@@ -49,6 +49,24 @@ struct ContentView: View {
                 .disabled(viewModel.isRecording)
                 .fixedSize()
 
+                Toggle(isOn: $settings.disableDiarization) {
+                    Label("No diar", systemImage: "person.slash")
+                        .font(.caption)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .disabled(viewModel.isRecording)
+                .fixedSize()
+
+                Toggle(isOn: $settings.enableCorrection) {
+                    Label("AI fix", systemImage: "wand.and.stars")
+                        .font(.caption)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .disabled(viewModel.isRecording)
+                .fixedSize()
+
                 Spacer()
 
                 SettingsLink {
@@ -87,7 +105,7 @@ struct ContentView: View {
             }
 
             // Status bar
-            if viewModel.isLoading || viewModel.errorMessage != nil {
+            if viewModel.isLoading || viewModel.errorMessage != nil || viewModel.savedFilePath != nil {
                 Divider()
                 HStack(spacing: 8) {
                     if viewModel.isLoading {
@@ -105,6 +123,23 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.red)
                             .lineLimit(2)
+                    }
+                    if let path = viewModel.savedFilePath {
+                        Image(systemName: "doc.text.fill")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                        Text(path)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .onTapGesture {
+                                NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
+                            }
+                            .onHover { hovering in
+                                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                            }
                     }
                     Spacer()
                 }

@@ -120,6 +120,30 @@ final class AppSettings {
         }
     }
 
+    var disableDiarization: Bool {
+        get {
+            access(keyPath: \.disableDiarization)
+            return Self.defaults.bool(forKey: "disableDiarization")
+        }
+        set {
+            withMutation(keyPath: \.disableDiarization) {
+                Self.defaults.set(newValue, forKey: "disableDiarization")
+            }
+        }
+    }
+
+    var enableCorrection: Bool {
+        get {
+            access(keyPath: \.enableCorrection)
+            return Self.defaults.bool(forKey: "enableCorrection")
+        }
+        set {
+            withMutation(keyPath: \.enableCorrection) {
+                Self.defaults.set(newValue, forKey: "enableCorrection")
+            }
+        }
+    }
+
     // MARK: - Computed Helpers
 
     var resolvedOutputDirectory: String {
@@ -147,7 +171,9 @@ final class AppSettings {
             micOnly: micOnly,
             systemOnly: systemOnly,
             multilingual: multilingual,
-            dumpAudio: dumpAudio
+            dumpAudio: dumpAudio,
+            disableDiarization: disableDiarization,
+            enableCorrection: enableCorrection
         )
     }
 }

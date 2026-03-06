@@ -14,6 +14,8 @@ public struct LivekeetConfig: Sendable {
     public var multilingual: Bool
     public var showStatus: Bool
     public var dumpAudio: Bool
+    public var disableDiarization: Bool
+    public var enableCorrection: Bool
 
     public init(
         outputDirectory: String = "",
@@ -25,7 +27,9 @@ public struct LivekeetConfig: Sendable {
         systemOnly: Bool = false,
         multilingual: Bool = false,
         showStatus: Bool = false,
-        dumpAudio: Bool = false
+        dumpAudio: Bool = false,
+        disableDiarization: Bool = false,
+        enableCorrection: Bool = false
     ) {
         self.outputDirectory = outputDirectory
         self.filenamePattern = filenamePattern
@@ -37,6 +41,8 @@ public struct LivekeetConfig: Sendable {
         self.multilingual = multilingual
         self.showStatus = showStatus
         self.dumpAudio = dumpAudio
+        self.disableDiarization = disableDiarization
+        self.enableCorrection = enableCorrection
     }
 
     // MARK: - Computed Properties
