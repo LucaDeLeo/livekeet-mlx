@@ -1,7 +1,9 @@
+import Sparkle
 import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppSettings.self) private var settings
+    let updater: SPUUpdater
 
     var body: some View {
         @Bindable var settings = settings
@@ -15,6 +17,11 @@ struct SettingsView: View {
             advancedTab(settings: $settings)
                 .tabItem {
                     Label("Advanced", systemImage: "wrench")
+                }
+
+            updatesTab
+                .tabItem {
+                    Label("Updates", systemImage: "arrow.triangle.2.circlepath")
                 }
         }
         .frame(width: 460)
@@ -73,6 +80,21 @@ struct SettingsView: View {
                 Text("Save raw audio chunks alongside the transcript for debugging.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var updatesTab: some View {
+        Form {
+            Section("Software Update") {
+                CheckForUpdatesView(updater: updater)
+                    .buttonStyle(.borderedProminent)
+
+                Toggle("Automatically check for updates", isOn: Binding(
+                    get: { updater.automaticallyChecksForUpdates },
+                    set: { updater.automaticallyChecksForUpdates = $0 }
+                ))
             }
         }
         .formStyle(.grouped)

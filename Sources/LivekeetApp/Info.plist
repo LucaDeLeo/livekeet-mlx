@@ -2,9 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Livekeet needs microphone access to transcribe audio.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Livekeet needs screen recording to capture system audio.</string>
+	<key>SUFeedURL</key>
+	<string>https://lucadeleo.github.io/livekeet-mlx/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>U3j5A11hnsFxO2rE614jFyKByBikAX2c8VSn+2bLdkM=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
 </dict>
 </plist>
