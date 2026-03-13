@@ -129,8 +129,9 @@ public actor Transcriber {
     private var simpleSegSysAudio: [Float] = []
     private var simpleSegSysStart: Date?
     private let simpleSegMaxDuration: TimeInterval = 10.0
-    private let simpleSegMinDuration: TimeInterval = 1.5
+    private let simpleSegMinDuration: TimeInterval = 0.5
     private let simpleSegSilenceThreshold: Float = 0.005
+    private static let minSegmentSamples = 8000  // 0.5s at 16kHz
 
     // Incremental batch diarization state
     private var batchMicState: StreamingState?
@@ -219,14 +220,14 @@ public actor Transcriber {
 
         // Transcription work queue
         let (tStream, tContinuation) = AsyncStream<TranscriptionWorkItem>.makeStream(
-            bufferingPolicy: .bufferingNewest(10)
+            bufferingPolicy: .unbounded
         )
         self.transcriptionStream = tStream
         self.transcriptionContinuation = tContinuation
 
         // Cap MLX buffer cache to prevent unbounded growth across inference calls.
         // Model weights are "active" memory, unaffected by cache limit.
-        Memory.cacheLimit = 256 * 1024 * 1024  // 256 MB
+        Memory.cacheLimit = 512 * 1024 * 1024  // 512 MB
 
         Log.info("Output: \(uniquePath.path)")
     }
@@ -325,36 +326,44 @@ public actor Transcriber {
             sysPCM.append(chunk.system)
         }
 
-        // Process mic channel
-        if !config.systemOnly {
-            if let micDetector = micDetector {
-                do {
-                    let micSegments = try await micDetector.feed(chunk.mic, at: chunk.timestamp)
-                    for segment in micSegments {
-                        enqueueTranscription(segment: segment, channel: "mic")
-                    }
-                } catch {
-                    Log.error("Mic detection error: \(error)")
-                }
-            } else if config.disableDiarization {
-                processSimpleSegmentation(chunk.mic, channel: "mic", at: chunk.timestamp)
+        // Process mic and system channels
+        let hasMic = !config.systemOnly
+        let hasSys = !config.micOnly && !chunk.system.isEmpty
+
+        if hasMic && hasSys, let micDet = micDetector, let sysDet = sysDetector {
+            // Run both Sortformer feeds concurrently
+            async let micResult: [DetectedSegment] = {
+                do { return try await micDet.feed(chunk.mic, at: chunk.timestamp) }
+                catch { Log.error("Mic detection error: \(error)"); return [] }
+            }()
+            async let sysResult: [DetectedSegment] = {
+                do { return try await sysDet.feed(chunk.system, at: chunk.timestamp) }
+                catch { Log.error("System detection error: \(error)"); return [] }
+            }()
+            let (micSegments, sysSegments) = await (micResult, sysResult)
+            for segment in micSegments { enqueueTranscription(segment: segment, channel: "mic") }
+            for segment in sysSegments { enqueueTranscription(segment: segment, channel: "system") }
+        } else {
+            if hasMic {
+                await feedChannel(chunk.mic, detector: micDetector, channel: "mic", at: chunk.timestamp)
+            }
+            if hasSys {
+                await feedChannel(chunk.system, detector: sysDetector, channel: "system", at: chunk.timestamp)
             }
         }
+    }
 
-        // Process system channel
-        if !config.micOnly && !chunk.system.isEmpty {
-            if let sysDetector = sysDetector {
-                do {
-                    let sysSegments = try await sysDetector.feed(chunk.system, at: chunk.timestamp)
-                    for segment in sysSegments {
-                        enqueueTranscription(segment: segment, channel: "system")
-                    }
-                } catch {
-                    Log.error("System detection error: \(error)")
+    private func feedChannel(_ audio: [Float], detector: SpeechDetector?, channel: String, at time: Date) async {
+        if let detector {
+            do {
+                for segment in try await detector.feed(audio, at: time) {
+                    enqueueTranscription(segment: segment, channel: channel)
                 }
-            } else if config.disableDiarization {
-                processSimpleSegmentation(chunk.system, channel: "system", at: chunk.timestamp)
+            } catch {
+                Log.error("\(channel.capitalized) detection error: \(error)")
             }
+        } else if config.disableDiarization {
+            processSimpleSegmentation(audio, channel: channel, at: time)
         }
     }
 
@@ -363,12 +372,8 @@ public actor Transcriber {
         let item = TranscriptionWorkItem(
             segment: segment, channel: channel, segmentNumber: segmentCounter
         )
-        let result = transcriptionContinuation.yield(item)
+        transcriptionContinuation.yield(item)
         pendingTranscriptionCount += 1
-        if case .dropped = result {
-            pendingTranscriptionCount -= 1
-            Log.warning("Transcription queue full, dropped oldest segment")
-        }
     }
 
     private func processSimpleSegmentation(_ audio: [Float], channel: String, at time: Date) {
@@ -471,18 +476,18 @@ public actor Transcriber {
             }
 
             // Skip very short segments that can cause model errors
-            guard item.segment.audio.count >= 24000 else { continue }
+            guard item.segment.audio.count >= Self.minSegmentSamples else { continue }
 
-            // Run STT inference off-actor to unblock audio processing
-            let audio = item.segment.audio
-            let audioDuration = item.segment.duration
+            // Trim leading/trailing silence to improve STT accuracy
+            let audio = Self.trimSilence(item.segment.audio, threshold: simpleSegSilenceThreshold, windowSize: 320)
+            guard audio.count >= Self.minSegmentSamples else { continue }
+            let audioDuration = Double(audio.count) / 16000.0
             nonisolated(unsafe) let model = sttModel
             let inferenceStart = Date()
 
             let result = await Task.detached {
                 let audioArray = MLXArray(audio)
                 let output = model.generate(audio: audioArray)
-                Memory.clearCache()
                 return output
             }.value
 
@@ -596,7 +601,6 @@ public actor Transcriber {
                 batchMicState = newState
                 batchMicTurns.append(contentsOf: output.segments)
                 micPCMLastBatchOffset = micPCM.sampleCount
-                Memory.clearCache()
             } catch {
                 Log.error("Batch diarization (mic) error: \(error)")
             }
@@ -618,7 +622,6 @@ public actor Transcriber {
                 batchSysState = newState
                 batchSysTurns.append(contentsOf: output.segments)
                 sysPCMLastBatchOffset = sysPCM.sampleCount
-                Memory.clearCache()
             } catch {
                 Log.error("Batch diarization (system) error: \(error)")
             }
@@ -802,6 +805,60 @@ public actor Transcriber {
         }
         await writer.rewriteAll(segments: writerSegments)
         eventContinuation.yield(.rewrite(transcriptSegments))
+    }
+
+    // MARK: - Audio Utilities
+
+    /// Trim leading and trailing silence from audio samples using a sliding RMS window.
+    static func trimSilence(_ audio: [Float], threshold: Float, windowSize: Int) -> [Float] {
+        guard audio.count > windowSize else { return audio }
+
+        let thresholdSquared = threshold * threshold * Float(windowSize)
+
+        // Compute initial window sum-of-squares
+        var sum: Float = 0
+        for j in 0..<windowSize { sum += audio[j] * audio[j] }
+
+        // Slide forward to find first window above threshold
+        var start = 0
+        if sum >= thresholdSquared {
+            start = 0
+        } else {
+            var found = false
+            for i in 1...(audio.count - windowSize) {
+                sum -= audio[i - 1] * audio[i - 1]
+                sum += audio[i + windowSize - 1] * audio[i + windowSize - 1]
+                if sum >= thresholdSquared {
+                    start = i
+                    found = true
+                    break
+                }
+            }
+            if !found { return audio }
+        }
+
+        // Compute initial window sum-of-squares from end
+        var sumEnd: Float = 0
+        let lastStart = audio.count - windowSize
+        for j in lastStart..<audio.count { sumEnd += audio[j] * audio[j] }
+
+        // Slide backward to find last window above threshold
+        var end = audio.count
+        if sumEnd >= thresholdSquared {
+            end = audio.count
+        } else {
+            for i in stride(from: lastStart - 1, through: start, by: -1) {
+                sumEnd -= audio[i + windowSize] * audio[i + windowSize]
+                sumEnd += audio[i] * audio[i]
+                if sumEnd >= thresholdSquared {
+                    end = min(i + windowSize, audio.count)
+                    break
+                }
+            }
+        }
+
+        guard start < end, (end - start) >= minSegmentSamples else { return audio }
+        return Array(audio[start..<end])
     }
 
     // MARK: - Status Workers

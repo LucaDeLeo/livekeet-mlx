@@ -8,7 +8,7 @@ import ScreenCaptureKit
 
 let targetSampleRate: Double = 16000
 let outputFrameSize = 1024  // ~64ms at 16kHz
-let ringBufferCapacity = 32768  // Power-of-2 (~2s at 16kHz)
+let ringBufferCapacity = 131072  // Power-of-2 (~8s at 16kHz)
 let minBufferSamples = Int(targetSampleRate * 0.2)  // 200ms pre-buffer
 
 // MARK: - AudioChunk
@@ -246,7 +246,7 @@ public final class AudioCapture: @unchecked Sendable {
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
         config.sampleRate = 48000
-        config.channelCount = 2
+        config.channelCount = 1
         config.queueDepth = 8
         config.width = 2
         config.height = 2

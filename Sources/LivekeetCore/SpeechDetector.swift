@@ -46,7 +46,7 @@ public actor SpeechDetector {
     public init(
         model: SortformerModel,
         threshold: Float = 0.5,
-        minDuration: TimeInterval = 1.0,
+        minDuration: TimeInterval = 0.5,
         minEnergy: Float = 0.005
     ) {
         self.model = model
