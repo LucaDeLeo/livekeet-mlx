@@ -1,23 +1,39 @@
 import Foundation
 
-/// Calls a Python sidecar script (using claude-runner + Claude Haiku) to fix STT errors.
+/// Calls a Python sidecar script (using claude-runner) to fix STT errors.
+///
+/// Prompt assembly happens in Swift via `CorrectionPromptBuilder`; the Python script is a
+/// thin wrapper that just invokes `claude_runner.run_sync` with the given prompt and model.
 public actor TranscriptCorrector {
+
+    public struct Settings: Sendable {
+        public let basePrompt: String
+        public let model: String
+
+        public init(
+            basePrompt: String = CorrectionPromptBuilder.defaultBasePrompt,
+            model: String = CorrectionPromptBuilder.defaultModel
+        ) {
+            self.basePrompt = basePrompt
+            self.model = model
+        }
+    }
 
     public struct Correction: Codable, Sendable {
         public let index: Int
         public let text: String
     }
 
-    private struct SegmentWire: Codable {
-        let timestamp: String
-        let speaker: String
-        let text: String
-    }
-
     private struct Input: Codable {
-        let segments: [SegmentWire]
-        let context: [SegmentWire]
-        let speakers: [String]
+        let prompt: String
+        let systemPrompt: String
+        let model: String
+
+        enum CodingKeys: String, CodingKey {
+            case prompt
+            case systemPrompt = "system_prompt"
+            case model
+        }
     }
 
     private struct Output: Codable {
@@ -27,10 +43,12 @@ public actor TranscriptCorrector {
 
     private let scriptURL: URL
     private let cleanEnv: [String: String]
+    private let settings: Settings
+    private let promptBuilder: CorrectionPromptBuilder
     private var available = true
     private let timeoutSeconds: Double = 120
 
-    public init() throws {
+    public init(settings: Settings = Settings()) throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("livekeet_correct_\(ProcessInfo.processInfo.processIdentifier).py")
         try Self.embeddedScript.write(to: url, atomically: true, encoding: .utf8)
@@ -41,6 +59,9 @@ public actor TranscriptCorrector {
             env.removeValue(forKey: key)
         }
         self.cleanEnv = env
+
+        self.settings = settings
+        self.promptBuilder = CorrectionPromptBuilder(basePrompt: settings.basePrompt)
     }
 
     public func correct(
@@ -50,13 +71,13 @@ public actor TranscriptCorrector {
     ) async -> [Correction] {
         guard available else { return [] }
 
-        let toWire: (TranscriptSegment) -> SegmentWire = {
-            SegmentWire(timestamp: $0.timestamp, speaker: $0.speaker, text: $0.text)
-        }
+        let prompt = promptBuilder.build(
+            segments: segments, context: context, speakers: speakers
+        )
         let input = Input(
-            segments: segments.map(toWire),
-            context: context.map(toWire),
-            speakers: speakers
+            prompt: prompt,
+            systemPrompt: CorrectionPromptBuilder.defaultSystemPrompt,
+            model: settings.model
         )
         guard let inputJSON = try? JSONEncoder().encode(input) else {
             Log.error("Correction: failed to encode input")
@@ -71,7 +92,9 @@ public actor TranscriptCorrector {
                 Log.error("Correction API error: \(error)")
                 return []
             }
-            return output.corrections ?? []
+            let corrections = output.corrections ?? []
+            logDiffs(corrections: corrections, originals: segments)
+            return corrections
         } catch CorrectorError.notAvailable(let reason) {
             Log.warning("Transcript correction disabled: \(reason)")
             available = false
@@ -84,6 +107,17 @@ public actor TranscriptCorrector {
 
     public func cleanup() {
         try? FileManager.default.removeItem(at: scriptURL)
+    }
+
+    // MARK: - Diff Logging
+
+    private func logDiffs(corrections: [Correction], originals: [TranscriptSegment]) {
+        for correction in corrections {
+            guard correction.index >= 0, correction.index < originals.count else { continue }
+            let original = originals[correction.index].text
+            guard original != correction.text else { continue }
+            Log.debug("correction: '\(original)' -> '\(correction.text)'")
+        }
     }
 
     // MARK: - Process Management
@@ -144,16 +178,20 @@ public actor TranscriptCorrector {
         }.value
     }
 
-    private enum CorrectorError: Error, CustomStringConvertible {
+    public enum CorrectorError: Error, LocalizedError, CustomStringConvertible {
         case notAvailable(String)
         case processFailed(String)
 
-        var description: String {
+        public var errorDescription: String? {
             switch self {
-            case .notAvailable(let reason): return reason
-            case .processFailed(let msg): return "Process failed: \(msg)"
+            case .notAvailable(let reason):
+                return "Transcript correction unavailable: \(reason)"
+            case .processFailed(let msg):
+                return "Transcript correction failed: \(msg)"
             }
         }
+
+        public var description: String { errorDescription ?? "Correction error" }
     }
 
     // MARK: - Embedded Python Script
@@ -166,37 +204,11 @@ public actor TranscriptCorrector {
     clean_claude_env()
 
     data = json.load(sys.stdin)
-    segments = data["segments"]
-    context = data.get("context", [])
-    speakers = data.get("speakers", [])
+    prompt = data["prompt"]
+    system_prompt = data.get("system_prompt", "")
+    model = data.get("model", "claude-haiku-4-5-20251001")
 
-    parts = [
-        "Fix obvious speech-to-text errors in the transcript segments below.",
-        "Only fix clear mistakes: misspellings, homophones, garbled words, missing punctuation.",
-        "Do NOT rephrase, restructure, or change meaning.",
-        "",
-        'Return a JSON array: [{"index": 0, "text": "corrected text"}, ...]',
-        "Include ONLY segments that need corrections. Return [] if all are correct.",
-        "Output ONLY the JSON array, no markdown fences, no explanation.",
-    ]
-
-    if speakers:
-        parts.append(f"\\nSpeakers in this conversation: {', '.join(speakers)}")
-
-    if context:
-        parts.append("\\nRecent context (for reference, do NOT correct):")
-        for s in context:
-            parts.append(f"  [{s['timestamp']}] {s['speaker']}: {s['text']}")
-
-    parts.append("\\nSegments to correct:")
-    for i, s in enumerate(segments):
-        parts.append(f'{i}: [{s["timestamp"]}] {s["speaker"]}: "{s["text"]}"')
-
-    result = run_sync(
-        "\\n".join(parts),
-        model="claude-haiku-4-5-20251001",
-        system_prompt="You are a transcription correction assistant. Output only valid JSON arrays.",
-    )
+    result = run_sync(prompt, model=model, system_prompt=system_prompt)
 
     if result.is_error:
         json.dump({"error": result.error}, sys.stdout)

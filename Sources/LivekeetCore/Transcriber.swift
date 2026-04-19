@@ -28,6 +28,40 @@ public enum TranscriptEvent: Sendable {
     case completed(outputPath: String)
 }
 
+// MARK: - Debug Stats
+
+public struct DebugStats: Sendable {
+    public let timestamp: Date
+    public let isRecording: Bool
+    public let totalSegments: Int
+    public let pendingTranscriptions: Int
+    public let lastAudioTime: Date?
+    public let recordingStartTime: Date?
+    public let lastInferenceAudioDuration: Double?
+    public let lastInferenceTime: Double?
+    public let lastInferenceRatio: Double?
+    public let mlxActiveMemoryMB: Int
+    public let mlxCacheMemoryMB: Int
+    public let micOverflowCount: Int
+    public let micOverflowSamples: Int
+    public let systemOverflowCount: Int
+    public let systemOverflowSamples: Int
+
+    public var pipelineState: String {
+        guard isRecording else { return "Idle" }
+        guard let lastAudio = lastAudioTime else { return "Waiting for audio" }
+        let audioAge = Date().timeIntervalSince(lastAudio)
+        if audioAge > 10 { return "Stuck?" }
+        if pendingTranscriptions > 0 { return "Processing" }
+        return "Recording"
+    }
+
+    public var secondsSinceLastAudio: Double? {
+        guard let lastAudio = lastAudioTime else { return nil }
+        return Date().timeIntervalSince(lastAudio)
+    }
+}
+
 // MARK: - Disk-Backed PCM Storage
 
 /// Append-only raw Float32 PCM file for incremental audio storage on disk.
@@ -91,9 +125,10 @@ private struct TranscriptionWorkItem: Sendable {
 /// Main pipeline orchestrator: AudioCapture → SpeechDetector (Sortformer) → Parakeet → MarkdownWriter.
 public actor Transcriber {
     private let capture: AudioCapture
-    private let micDetector: SpeechDetector?
-    private let sysDetector: SpeechDetector?
+    private var micDetector: SpeechDetector?
+    private var sysDetector: SpeechDetector?
     private nonisolated(unsafe) let sttModel: any STTGenerationModel
+    private var lazyDiarTask: Task<Void, Never>?
     private let writer: MarkdownWriter
     private let outputPath: URL
     private let config: LivekeetConfig
@@ -112,7 +147,7 @@ public actor Transcriber {
     private let pcmTempDir: URL
     private var transcriptSegments: [TranscriptSegment] = []
     private var recordingStartTime: Date?
-    private let sortformerModel: SortformerModel?
+    private var sortformerModel: SortformerModel?
     private var batchPassCount = 0
     private var speakerRenames: [SpeakerKey: String] = [:]
 
@@ -131,7 +166,7 @@ public actor Transcriber {
     private let simpleSegMaxDuration: TimeInterval = 10.0
     private let simpleSegMinDuration: TimeInterval = 0.5
     private let simpleSegSilenceThreshold: Float = 0.005
-    private static let minSegmentSamples = 8000  // 0.5s at 16kHz
+    private static let minSegmentSamples = 16000  // 1.0s at 16kHz
 
     // Incremental batch diarization state
     private var batchMicState: StreamingState?
@@ -152,6 +187,11 @@ public actor Transcriber {
     private let noAudioWarningSeconds: TimeInterval = 10
     private let statusInterval: TimeInterval = 10
 
+    // Last STT inference stats (for debug panel)
+    private var lastInferenceAudioDuration: Double?
+    private var lastInferenceTime: Double?
+    private var lastInferenceRatio: Double?
+
     /// Stream of transcript events. Safe to access from any isolation domain.
     public nonisolated var events: AsyncStream<TranscriptEvent> { eventStream }
 
@@ -163,34 +203,52 @@ public actor Transcriber {
         self.config = config
         self.capture = AudioCapture(micOnly: config.micOnly, systemOnly: config.systemOnly)
 
-        // Load STT model (auto-detect type from model name)
         let modelName = config.modelName
         let shortName = modelName.split(separator: "/").last.map(String.init) ?? modelName
-        Log.info("Loading \(shortName)...")
-        let lowered = modelName.lowercased()
-        if lowered.contains("qwen") && lowered.contains("asr") {
-            self.sttModel = try await Qwen3ASRModel.fromPretrained(modelName)
-        } else if lowered.contains("voxtral") {
-            self.sttModel = try await VoxtralRealtimeModel.fromPretrained(modelName)
-        } else {
-            self.sttModel = try await ParakeetModel.fromPretrained(modelName)
-        }
-        Log.info("STT model ready")
+        let diarEnabled = !config.disableDiarization
+        let loadStart = Date()
 
-        // Load Sortformer diarization model (unless disabled)
-        if !config.disableDiarization {
-            Log.info("Loading speaker diarization model...")
-            let sortformerModel = try await SortformerModel.fromPretrained("mlx-community/diar_sortformer_4spk-v1-fp32")
-            self.sortformerModel = sortformerModel
-            self.micDetector = config.systemOnly ? nil : SpeechDetector(model: sortformerModel)
-            self.sysDetector = config.micOnly ? nil : SpeechDetector(model: sortformerModel)
-            Log.info("Diarization model ready")
+        // STT: hot-start from prewarm cache if available. If the cache is empty but a prewarm
+        // is in flight for THIS model, wait for it instead of kicking off a redundant fresh load.
+        var sttFromCache = await ModelPrewarmer.shared.takeSTT(name: modelName)
+        if sttFromCache == nil {
+            await ModelPrewarmer.shared.awaitPrewarmSTT(name: modelName)
+            sttFromCache = await ModelPrewarmer.shared.takeSTT(name: modelName)
+        }
+        let sttModel: any STTGenerationModel
+        let sttElapsed: TimeInterval
+        if let sttFromCache {
+            sttModel = sttFromCache
+            sttElapsed = 0
+            Log.info("STT \(shortName): reused from prewarm cache")
         } else {
-            Log.info("Diarization disabled")
-            self.sortformerModel = nil
+            Log.info("Loading STT \(shortName)...")
+            (sttModel, sttElapsed) = try await Self.loadSTTModel(name: modelName)
+        }
+        self.sttModel = sttModel
+
+        // Diarization: hot-start from cache, else start nil and fill in asynchronously.
+        // While nil, feedChannel falls back to simple energy-based segmentation — recording
+        // isn't blocked on Sortformer loading.
+        let sortformerFromCache = diarEnabled
+            ? await ModelPrewarmer.shared.takeSortformer()
+            : nil
+        self.sortformerModel = sortformerFromCache
+        if let sortformerFromCache {
+            self.micDetector = config.systemOnly ? nil : SpeechDetector(model: sortformerFromCache)
+            self.sysDetector = config.micOnly ? nil : SpeechDetector(model: sortformerFromCache)
+        } else {
             self.micDetector = nil
             self.sysDetector = nil
         }
+
+        let wall = Date().timeIntervalSince(loadStart)
+        let diarStatus: String = {
+            if !diarEnabled { return "disabled" }
+            if sortformerFromCache != nil { return "cached" }
+            return "loading in background"
+        }()
+        Log.info(String(format: "Ready in %.1fs (STT %.1fs, diarization %@)", wall, sttElapsed, diarStatus))
 
         // Resolve output path
         let outputPath = resolveOutputPath(arg: outputArg, config: config)
@@ -230,6 +288,33 @@ public actor Transcriber {
         Memory.cacheLimit = 512 * 1024 * 1024  // 512 MB
 
         Log.info("Output: \(uniquePath.path)")
+
+        if diarEnabled && sortformerFromCache == nil {
+            self.lazyDiarTask = Task.detached(priority: .utility) { [weak self] in
+                // If prewarm is still loading Sortformer, wait for its result before loading fresh.
+                await ModelPrewarmer.shared.awaitPrewarmDiar()
+                if let cached = await ModelPrewarmer.shared.takeSortformer() {
+                    await self?.attachLazyDiarization(model: cached, elapsed: 0)
+                    return
+                }
+                do {
+                    let (model, elapsed) = try await Transcriber.loadDiarizationModel(enabled: true)
+                    if let model {
+                        await self?.attachLazyDiarization(model: model, elapsed: elapsed)
+                    }
+                } catch {
+                    Log.warning("Lazy diarization load failed: \(error). Continuing with simple segmentation.")
+                }
+            }
+        }
+    }
+
+    private func attachLazyDiarization(model: SortformerModel, elapsed: TimeInterval) {
+        guard !isStopped, sortformerModel == nil else { return }
+        sortformerModel = model
+        micDetector = config.systemOnly ? nil : SpeechDetector(model: model)
+        sysDetector = config.micOnly ? nil : SpeechDetector(model: model)
+        Log.info(String(format: "Diarization attached after %.1fs", elapsed))
     }
 
     // MARK: - Run
@@ -308,6 +393,8 @@ public actor Transcriber {
     /// Stop the transcriber gracefully.
     public func stop() {
         isStopped = true
+        lazyDiarTask?.cancel()
+        lazyDiarTask = nil
     }
 
     // MARK: - Processing
@@ -362,7 +449,8 @@ public actor Transcriber {
             } catch {
                 Log.error("\(channel.capitalized) detection error: \(error)")
             }
-        } else if config.disableDiarization {
+        } else {
+            // Detector missing — either diarization disabled or still loading in background.
             processSimpleSegmentation(audio, channel: channel, at: time)
         }
     }
@@ -397,7 +485,7 @@ public actor Transcriber {
             // Check if the last 0.5s is silence
             let tailCount = min(Int(16000 * 0.5), segAudio.count)
             let tail = segAudio.suffix(tailCount)
-            let rms = sqrt(tail.reduce(Float(0)) { $0 + $1 * $1 } / Float(tail.count))
+            let rms = AudioAnalysis.rms(tail)
             shouldEmit = rms < simpleSegSilenceThreshold
         }
 
@@ -494,6 +582,9 @@ public actor Transcriber {
             let inferenceTime = Date().timeIntervalSince(inferenceStart)
             let ratio = audioDuration / inferenceTime
             Log.info("STT inference: \(String(format: "%.1f", audioDuration))s audio in \(String(format: "%.1f", inferenceTime))s (\(String(format: "%.1f", ratio))x realtime)")
+            lastInferenceAudioDuration = audioDuration
+            lastInferenceTime = inferenceTime
+            lastInferenceRatio = ratio
 
             await writeTranscriptionResult(result, segment: item.segment, channel: item.channel)
         }
@@ -502,7 +593,7 @@ public actor Transcriber {
     private func writeTranscriptionResult(
         _ result: STTOutput, segment: DetectedSegment, channel: String
     ) async {
-        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = TranscriptArtifactFilter.clean(result.text)
         guard !text.isEmpty else { return }
 
         let speaker = resolveSpeaker(channel: channel, speakerIndex: segment.speakerIndex)
@@ -518,7 +609,7 @@ public actor Transcriber {
             for sentence in sentences {
                 guard let sentenceText = sentence["text"] as? String,
                       let sentenceStart = sentence["start"] as? Double else { continue }
-                let trimmed = sentenceText.trimmingCharacters(in: .whitespacesAndNewlines)
+                let trimmed = TranscriptArtifactFilter.clean(sentenceText)
                 guard !trimmed.isEmpty else { continue }
                 let sentenceTime = segment.startTime.addingTimeInterval(sentenceStart)
                 let seg = TranscriptSegment(
@@ -695,7 +786,11 @@ public actor Transcriber {
 
     private func correctionWorker() async {
         do {
-            corrector = try TranscriptCorrector()
+            let settings = TranscriptCorrector.Settings(
+                basePrompt: config.correctionPrompt,
+                model: config.correctionModel
+            )
+            corrector = try TranscriptCorrector(settings: settings)
         } catch {
             Log.error("Failed to initialize transcript corrector: \(error)")
             return
@@ -807,6 +902,56 @@ public actor Transcriber {
         eventContinuation.yield(.rewrite(transcriptSegments))
     }
 
+    // MARK: - Debug Stats
+
+    public func debugStats() -> DebugStats {
+        let snap = Memory.snapshot()
+        let micOvf = capture.micBuffer.overflows
+        let sysOvf = capture.systemBuffer.overflows
+        return DebugStats(
+            timestamp: Date(),
+            isRecording: !isStopped,
+            totalSegments: transcriptSegments.count,
+            pendingTranscriptions: pendingTranscriptionCount,
+            lastAudioTime: lastAudioTime,
+            recordingStartTime: recordingStartTime,
+            lastInferenceAudioDuration: lastInferenceAudioDuration,
+            lastInferenceTime: lastInferenceTime,
+            lastInferenceRatio: lastInferenceRatio,
+            mlxActiveMemoryMB: snap.activeMemory / (1024 * 1024),
+            mlxCacheMemoryMB: snap.cacheMemory / (1024 * 1024),
+            micOverflowCount: micOvf.count,
+            micOverflowSamples: micOvf.samples,
+            systemOverflowCount: sysOvf.count,
+            systemOverflowSamples: sysOvf.samples
+        )
+    }
+
+    // MARK: - Model Loading
+
+    static func loadSTTModel(name: String) async throws -> (any STTGenerationModel, TimeInterval) {
+        let start = Date()
+        let lowered = name.lowercased()
+        let model: any STTGenerationModel
+        if lowered.contains("qwen") && lowered.contains("asr") {
+            model = try await Qwen3ASRModel.fromPretrained(name)
+        } else if lowered.contains("voxtral") {
+            model = try await VoxtralRealtimeModel.fromPretrained(name)
+        } else {
+            model = try await ParakeetModel.fromPretrained(name)
+        }
+        return (model, Date().timeIntervalSince(start))
+    }
+
+    static func loadDiarizationModel(enabled: Bool) async throws -> (SortformerModel?, TimeInterval) {
+        guard enabled else { return (nil, 0) }
+        let start = Date()
+        let model = try await SortformerModel.fromPretrained(diarizationModelName)
+        return (model, Date().timeIntervalSince(start))
+    }
+
+    static let diarizationModelName = "mlx-community/diar_sortformer_4spk-v1-fp32"
+
     // MARK: - Audio Utilities
 
     /// Trim leading and trailing silence from audio samples using a sliding RMS window.
@@ -857,8 +1002,13 @@ public actor Transcriber {
             }
         }
 
-        guard start < end, (end - start) >= minSegmentSamples else { return audio }
-        return Array(audio[start..<end])
+        // Pad by one window on each side so quiet word-initial/-final consonants
+        // (p, t, k, f, s) aren't clipped off, which makes the STT model hallucinate.
+        let paddedStart = max(0, start - windowSize)
+        let paddedEnd = min(audio.count, end + windowSize)
+
+        guard paddedStart < paddedEnd, (paddedEnd - paddedStart) >= minSegmentSamples else { return audio }
+        return Array(audio[paddedStart..<paddedEnd])
     }
 
     // MARK: - Status Workers

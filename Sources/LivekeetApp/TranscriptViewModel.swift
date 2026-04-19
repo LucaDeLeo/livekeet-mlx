@@ -25,10 +25,12 @@ final class TranscriptViewModel {
     var renamingSpeakerIndex: Int?
     var renameText: String = ""
     var isShowingRename = false
+    var debugStats: DebugStats?
 
     private var transcriber: Transcriber?
     private nonisolated(unsafe) var eventTask: Task<Void, Never>?
     private nonisolated(unsafe) var runTask: Task<Void, Never>?
+    private nonisolated(unsafe) var debugPollTask: Task<Void, Never>?
 
     func startRecording(config: LivekeetConfig) {
         guard !isRecording else { return }
@@ -71,6 +73,7 @@ final class TranscriptViewModel {
         guard isRecording else { return }
         isRecording = false
         isLoading = false
+        stopDebugPolling()
         Task {
             await transcriber?.stop()
             eventTask?.cancel()
@@ -78,6 +81,23 @@ final class TranscriptViewModel {
             runTask?.cancel()
             runTask = nil
         }
+    }
+
+    func startDebugPolling() {
+        guard debugPollTask == nil, let transcriber else { return }
+        debugPollTask = Task {
+            while !Task.isCancelled {
+                let stats = await transcriber.debugStats()
+                self.debugStats = stats
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+    }
+
+    func stopDebugPolling() {
+        debugPollTask?.cancel()
+        debugPollTask = nil
+        debugStats = nil
     }
 
     func beginRename(channel: String, speakerIndex: Int, currentName: String) {
@@ -123,5 +143,6 @@ final class TranscriptViewModel {
     deinit {
         eventTask?.cancel()
         runTask?.cancel()
+        debugPollTask?.cancel()
     }
 }

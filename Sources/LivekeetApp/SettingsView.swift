@@ -1,5 +1,11 @@
+import LivekeetCore
 import Sparkle
 import SwiftUI
+
+private enum ModelSelection: Hashable {
+    case preset(String)
+    case custom
+}
 
 struct SettingsView: View {
     @Environment(AppSettings.self) private var settings
@@ -63,14 +69,47 @@ struct SettingsView: View {
             }
 
             Section("Model") {
-                TextField("Default model", text: settings.defaultModel)
-                    .textFieldStyle(.roundedBorder)
-                Text("Downloaded automatically on first use. English: parakeet-tdt-0.6b-v2, Multilingual: parakeet-tdt-0.6b-v3")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                modelPicker(settings: settings)
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func modelPicker(settings: Bindable<AppSettings>) -> some View {
+        let matched = ModelCatalog.descriptor(for: self.settings.defaultModel)
+        let selection: ModelSelection = matched.map { .preset($0.id) } ?? .custom
+
+        return VStack(alignment: .leading, spacing: 6) {
+            Picker("Default model", selection: Binding<ModelSelection>(
+                get: { selection },
+                set: { newValue in
+                    if case .preset(let id) = newValue {
+                        self.settings.defaultModel = id
+                    }
+                }
+            )) {
+                ForEach(ModelCatalog.availableModels) { model in
+                    Text(model.displayName).tag(ModelSelection.preset(model.id))
+                }
+                Text("Custom…").tag(ModelSelection.custom)
+            }
+
+            if let matched {
+                Text("\(matched.subtitle) · \(matched.sizeDescription)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Custom model id")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Hugging Face model id", text: settings.defaultModel)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            Text("Models are downloaded automatically on first use.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private func advancedTab(settings: Bindable<AppSettings>) -> some View {
@@ -78,6 +117,42 @@ struct SettingsView: View {
             Section("Audio") {
                 Toggle("Dump audio to disk", isOn: settings.dumpAudio)
                 Text("Save raw audio chunks alongside the transcript for debugging.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("AI Correction") {
+                Toggle("Enable correction (uses Claude Haiku)", isOn: settings.enableCorrection)
+                Text("Sends recent transcript segments to the Anthropic API via the claude-runner sidecar.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                TextField("Model", text: settings.correctionModel)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(!self.settings.enableCorrection)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Correction prompt")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: settings.correctionPrompt)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minHeight: 120)
+                        .border(Color.secondary.opacity(0.3))
+                        .disabled(!self.settings.enableCorrection)
+                    HStack {
+                        Spacer()
+                        Button("Reset to default") {
+                            self.settings.correctionPrompt = CorrectionPromptBuilder.defaultBasePrompt
+                        }
+                        .disabled(!self.settings.enableCorrection)
+                    }
+                }
+            }
+
+            Section("Diagnostics") {
+                Toggle("Debug mode", isOn: settings.debugMode)
+                Text("Show pipeline stats panel while recording.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

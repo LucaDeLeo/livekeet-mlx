@@ -144,6 +144,52 @@ final class AppSettings {
         }
     }
 
+    var debugMode: Bool {
+        get {
+            access(keyPath: \.debugMode)
+            return Self.defaults.bool(forKey: "debugMode")
+        }
+        set {
+            withMutation(keyPath: \.debugMode) {
+                Self.defaults.set(newValue, forKey: "debugMode")
+            }
+        }
+    }
+
+    var correctionPrompt: String {
+        get {
+            access(keyPath: \.correctionPrompt)
+            return Self.defaults.string(forKey: "correctionPrompt") ?? CorrectionPromptBuilder.defaultBasePrompt
+        }
+        set {
+            withMutation(keyPath: \.correctionPrompt) {
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    Self.defaults.removeObject(forKey: "correctionPrompt")
+                } else {
+                    Self.defaults.set(newValue, forKey: "correctionPrompt")
+                }
+            }
+        }
+    }
+
+    var correctionModel: String {
+        get {
+            access(keyPath: \.correctionModel)
+            return Self.defaults.string(forKey: "correctionModel") ?? CorrectionPromptBuilder.defaultModel
+        }
+        set {
+            withMutation(keyPath: \.correctionModel) {
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    Self.defaults.removeObject(forKey: "correctionModel")
+                } else {
+                    Self.defaults.set(newValue, forKey: "correctionModel")
+                }
+            }
+        }
+    }
+
     // MARK: - Computed Helpers
 
     var resolvedOutputDirectory: String {
@@ -173,7 +219,9 @@ final class AppSettings {
             multilingual: multilingual,
             dumpAudio: dumpAudio,
             disableDiarization: disableDiarization,
-            enableCorrection: enableCorrection
+            enableCorrection: enableCorrection,
+            correctionPrompt: correctionPrompt,
+            correctionModel: correctionModel
         )
     }
 }

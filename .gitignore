@@ -3,6 +3,7 @@
 .DS_Store
 *.md
 !README.md
+!PRIVACY_AUDIT.md
 *.audio/
 .sparkle/
 dist/

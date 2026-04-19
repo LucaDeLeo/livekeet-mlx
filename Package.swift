@@ -39,5 +39,10 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
             ]
         ),
+        .testTarget(
+            name: "LivekeetCoreTests",
+            dependencies: ["LivekeetCore"],
+            path: "Tests/LivekeetCoreTests"
+        ),
     ]
 )

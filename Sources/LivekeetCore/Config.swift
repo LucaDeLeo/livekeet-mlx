@@ -16,6 +16,8 @@ public struct LivekeetConfig: Sendable {
     public var dumpAudio: Bool
     public var disableDiarization: Bool
     public var enableCorrection: Bool
+    public var correctionPrompt: String
+    public var correctionModel: String
 
     public init(
         outputDirectory: String = "",
@@ -29,7 +31,9 @@ public struct LivekeetConfig: Sendable {
         showStatus: Bool = false,
         dumpAudio: Bool = false,
         disableDiarization: Bool = false,
-        enableCorrection: Bool = false
+        enableCorrection: Bool = false,
+        correctionPrompt: String = CorrectionPromptBuilder.defaultBasePrompt,
+        correctionModel: String = CorrectionPromptBuilder.defaultModel
     ) {
         self.outputDirectory = outputDirectory
         self.filenamePattern = filenamePattern
@@ -43,6 +47,8 @@ public struct LivekeetConfig: Sendable {
         self.dumpAudio = dumpAudio
         self.disableDiarization = disableDiarization
         self.enableCorrection = enableCorrection
+        self.correctionPrompt = correctionPrompt
+        self.correctionModel = correctionModel
     }
 
     // MARK: - Computed Properties

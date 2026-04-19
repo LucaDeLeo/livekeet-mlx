@@ -1,3 +1,4 @@
+import LivekeetCore
 import SwiftUI
 
 struct ContentView: View {
@@ -104,6 +105,12 @@ struct ContentView: View {
                 }
             }
 
+            // Debug stats panel
+            if let stats = viewModel.debugStats, settings.debugMode {
+                Divider()
+                DebugStatsPanel(stats: stats)
+            }
+
             // Status bar
             if viewModel.isLoading || viewModel.errorMessage != nil || viewModel.savedFilePath != nil {
                 Divider()
@@ -153,6 +160,20 @@ struct ContentView: View {
             Button("Rename") { viewModel.confirmRename() }
             Button("Cancel", role: .cancel) { }
         }
+        .onChange(of: viewModel.isRecording) { _, isRecording in
+            if isRecording && settings.debugMode {
+                viewModel.startDebugPolling()
+            } else if !isRecording {
+                viewModel.stopDebugPolling()
+            }
+        }
+        .onChange(of: settings.debugMode) { _, debugMode in
+            if debugMode && viewModel.isRecording {
+                viewModel.startDebugPolling()
+            } else if !debugMode {
+                viewModel.stopDebugPolling()
+            }
+        }
         .frame(minWidth: 520, minHeight: 350)
     }
 
@@ -189,5 +210,80 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .keyboardShortcut("r", modifiers: .command)
+    }
+}
+
+// MARK: - Debug Stats Panel
+
+struct DebugStatsPanel: View {
+    let stats: DebugStats
+
+    var body: some View {
+        HStack(spacing: 12) {
+            statItem(stats.pipelineState, icon: pipelineIcon, color: pipelineColor)
+            divider
+            if let age = stats.secondsSinceLastAudio {
+                statItem(formatAge(age), icon: "waveform", color: age > 5 ? .red : .secondary)
+            } else {
+                statItem("No audio", icon: "waveform", color: .red)
+            }
+            divider
+            statItem("\(stats.pendingTranscriptions) pending", icon: "text.bubble", color: stats.pendingTranscriptions > 3 ? .orange : .secondary)
+            divider
+            if let dur = stats.lastInferenceAudioDuration, let ratio = stats.lastInferenceRatio {
+                statItem(String(format: "%.1fs @ %.1fx", dur, ratio), icon: "brain", color: ratio < 1.0 ? .red : .secondary)
+            } else {
+                statItem("-- STT", icon: "brain", color: .secondary)
+            }
+            divider
+            statItem("\(stats.mlxActiveMemoryMB)/\(stats.mlxCacheMemoryMB) MB", icon: "memorychip", color: .secondary)
+            divider
+            let ovf = stats.micOverflowCount + stats.systemOverflowCount
+            statItem("\(ovf) ovf", icon: "exclamationmark.triangle", color: ovf > 0 ? .orange : .secondary)
+            divider
+            statItem("\(stats.totalSegments) seg", icon: "doc.text", color: .secondary)
+            Spacer()
+        }
+        .font(.system(.caption2, design: .monospaced))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(.bar)
+    }
+
+    private var divider: some View {
+        Divider().frame(height: 12)
+    }
+
+    private func statItem(_ label: String, icon: String, color: Color) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon).foregroundStyle(color)
+            Text(label).foregroundStyle(color)
+        }
+    }
+
+    private var pipelineIcon: String {
+        switch stats.pipelineState {
+        case "Recording": "record.circle"
+        case "Processing": "gearshape.2"
+        case "Stuck?": "exclamationmark.triangle.fill"
+        case "Waiting for audio": "ear"
+        default: "pause.circle"
+        }
+    }
+
+    private var pipelineColor: Color {
+        switch stats.pipelineState {
+        case "Recording": .green
+        case "Processing": .blue
+        case "Stuck?": .red
+        case "Waiting for audio": .orange
+        default: .secondary
+        }
+    }
+
+    private func formatAge(_ seconds: Double) -> String {
+        if seconds < 1 { return "<1s ago" }
+        if seconds < 60 { return "\(Int(seconds))s ago" }
+        return "\(Int(seconds / 60))m ago"
     }
 }

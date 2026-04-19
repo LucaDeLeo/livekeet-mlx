@@ -40,14 +40,19 @@ public actor SpeechDetector {
     // Track last active segment for detecting silence gaps
     private var lastActiveEndTime: Float = 0
     private var lastActiveSpeaker: Int = 0
-    private var silenceGapThreshold: Float = 0.8  // seconds
+    private var silenceGapThreshold: Float = 1.5  // seconds
     private let maxSegmentDuration: TimeInterval = 10.0  // force emit during continuous speech
+
+    // True when Sortformer has reported at least one speech segment since the last emit.
+    // Without this, accumulated silence + tiny noise blips get emitted and fed to the STT
+    // model, which then hallucinates common filler words.
+    private var hadSpeechSinceEmit: Bool = false
 
     public init(
         model: SortformerModel,
         threshold: Float = 0.5,
         minDuration: TimeInterval = 0.5,
-        minEnergy: Float = 0.005
+        minEnergy: Float = 0.02
     ) {
         self.model = model
         self.threshold = threshold
@@ -133,6 +138,7 @@ public actor SpeechDetector {
         // as a speech boundary and emit the accumulated audio as a segment.
         if !output.segments.isEmpty {
             Log.debug("Diarization: \(output.segments.count) segments in chunk")
+            hadSpeechSinceEmit = true
         }
 
         for diarSegment in output.segments {
@@ -167,24 +173,28 @@ public actor SpeechDetector {
 
     private func emitCurrentSegment(speakerIndex: Int = 0) -> DetectedSegment? {
         guard !segmentAudio.isEmpty, let startTime = segmentStartTime else {
-            segmentAudio = []
-            segmentStartTime = nil
+            resetSegmentState()
+            return nil
+        }
+
+        // If Sortformer never detected speech during this accumulation, drop the buffer.
+        // Otherwise the STT model gets fed mostly-silent audio and hallucinates filler words.
+        guard hadSpeechSinceEmit else {
+            let seconds = Double(segmentAudio.count) / Double(sampleRate)
+            Log.debug("Dropped \(String(format: "%.1f", seconds))s of audio — no speech detected by Sortformer")
+            resetSegmentState()
             return nil
         }
 
         let duration = Double(segmentAudio.count) / Double(sampleRate)
         guard duration >= minDuration else {
-            segmentAudio = []
-            segmentStartTime = nil
+            resetSegmentState()
             return nil
         }
 
-        // Check minimum energy
-        let sumSquares = segmentAudio.reduce(Float(0)) { $0 + $1 * $1 }
-        let rms = sqrt(sumSquares / Float(segmentAudio.count))
+        let rms = AudioAnalysis.rms(segmentAudio)
         guard rms >= minEnergy else {
-            segmentAudio = []
-            segmentStartTime = nil
+            resetSegmentState()
             return nil
         }
 
@@ -197,8 +207,13 @@ public actor SpeechDetector {
             speakerIndex: speakerIndex
         )
 
+        resetSegmentState()
+        return segment
+    }
+
+    private func resetSegmentState() {
         segmentAudio = []
         segmentStartTime = nil
-        return segment
+        hadSpeechSinceEmit = false
     }
 }

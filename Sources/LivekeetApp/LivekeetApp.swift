@@ -1,3 +1,4 @@
+import LivekeetCore
 import Sparkle
 import SwiftUI
 
@@ -12,6 +13,19 @@ struct LivekeetApp: App {
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
+
+        // Prewarm STT + diarization in the background so the first "Start Recording"
+        // click is instant (or very close to it). Reads current settings via a fresh
+        // AppSettings — UserDefaults-backed — and captures only the resulting values.
+        let bootstrap = AppSettings()
+        let modelName = bootstrap.defaultModel
+        let diarEnabled = !bootstrap.disableDiarization
+        Task.detached(priority: .utility) {
+            await ModelPrewarmer.shared.startPrewarm(
+                sttModelName: modelName,
+                diarization: diarEnabled
+            )
+        }
     }
 
     var body: some Scene {

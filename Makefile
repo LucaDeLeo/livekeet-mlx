@@ -10,8 +10,11 @@ RELEASE_SIGNING_IDENTITY ?= Developer ID Application
 ENTITLEMENTS := $(CURDIR)/Sources/LivekeetApp/LivekeetApp.entitlements
 INFO_PLIST := $(CURDIR)/Sources/LivekeetApp/Info.plist
 SPARKLE_FRAMEWORK := .build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework
+SPARKLE_SIGN_UPDATE := .build/artifacts/sparkle/Sparkle/bin/sign_update
+APPCAST_URL_BASE ?= https://github.com/LucaDeLeo/livekeet-mlx/releases/download
+MIN_SYSTEM_VERSION ?= 14.0
 
-.PHONY: build build-release run clean build-app run-app build-release-app dmg notarize
+.PHONY: build build-release run clean build-app run-app build-release-app dmg notarize appcast-entry test
 
 build:
 	swift build --product livekeet
@@ -93,6 +96,43 @@ notarize:
 	@echo "Stapling notarization ticket..."
 	xcrun stapler staple dist/$(APP_NAME)-$(VERSION).dmg
 	@echo "Notarization complete."
+
+test:
+	swift test
+
+# --- Appcast entry generation ---
+#
+# Usage: make appcast-entry VERSION=x.y.z BUILD_NUMBER=NN
+#
+# Signs dist/$(APP_NAME)-$(VERSION).dmg with Sparkle's sign_update tool (reads the
+# ed25519 private key from the macOS keychain; run `generate_keys` once to create it)
+# and prints a ready-to-paste <item> block for appcast.xml.
+appcast-entry:
+	@DMG=dist/$(APP_NAME)-$(VERSION).dmg; \
+	if [ ! -f "$$DMG" ]; then \
+		echo "ERROR: $$DMG not found. Run 'make dmg VERSION=$(VERSION)' first." >&2; \
+		exit 1; \
+	fi; \
+	if [ ! -x "$(SPARKLE_SIGN_UPDATE)" ]; then \
+		echo "ERROR: $(SPARKLE_SIGN_UPDATE) not found. Run 'swift build' first to fetch Sparkle." >&2; \
+		exit 1; \
+	fi; \
+	SIG_OUTPUT=$$("$(SPARKLE_SIGN_UPDATE)" "$$DMG"); \
+	LEN=$$(stat -f %z "$$DMG"); \
+	PUBDATE=$$(date -u +"%a, %d %b %Y %H:%M:%S +0000"); \
+	printf '\n<item>\n' ; \
+	printf '  <title>Version %s</title>\n' "$(VERSION)"; \
+	printf '  <pubDate>%s</pubDate>\n' "$$PUBDATE"; \
+	printf '  <sparkle:version>%s</sparkle:version>\n' "$(BUILD_NUMBER)"; \
+	printf '  <sparkle:shortVersionString>%s</sparkle:shortVersionString>\n' "$(VERSION)"; \
+	printf '  <sparkle:minimumSystemVersion>%s</sparkle:minimumSystemVersion>\n' "$(MIN_SYSTEM_VERSION)"; \
+	printf '  <enclosure\n'; \
+	printf '    url="%s/v%s/%s-%s.dmg"\n' "$(APPCAST_URL_BASE)" "$(VERSION)" "$(APP_NAME)" "$(VERSION)"; \
+	printf '    type="application/octet-stream"\n'; \
+	printf '    %s\n' "$$SIG_OUTPUT"; \
+	printf '    length="%s"\n' "$$LEN"; \
+	printf '  />\n'; \
+	printf '</item>\n\n'
 
 clean:
 	rm -rf .build
